@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""holctl - HOL Light server controller for AI-assisted proof development.
+
+Manages multiple HOL Light TCP servers (monadius/hol_server) with DMTCP
+checkpointing, session isolation, and output truncation for LLM agents.
+
+Usage:
+    holctl start [--name NAME] [--checkpoint CKPT] [--port PORT]
+    holctl stop <server>
+    holctl stop-all
+    holctl list
+    holctl eval <server> <code>
+    holctl tactic <server> <tactic>
+    holctl goal <server> <goal_term>
+    holctl back <server> [N]
+    holctl search <server> <pattern>
+    holctl interrupt <server>
+    holctl status <server>
+    holctl checkpoint-create <name> [extra_ml...]
+    holctl checkpoint-list
+
+Servers are identified by name (e.g. "arm1", "x86-p256").
+Output is automatically truncated to --max-lines (default 60) to avoid
+filling the LLM context window. Use --full for untruncated output.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+
+# --- Configuration ---
+HOL_LIGHT_DIR = os.environ.get("HOL_LIGHT_DIR", os.path.expanduser("~/workspace/hol-light"))
+S2N_BIGNUM_DIR = os.environ.get("S2N_BIGNUM_DIR", os.path.expanduser("~/workspace/s2n-bignum"))
+REGISTRY_DIR = Path(os.environ.get("HOLCTL_REGISTRY_DIR",
+    os.path.expanduser("~/.holctl")))
+SESSION_ID = os.environ.get("HOLCTL_SESSION", os.environ.get("KIRO_SESSION_ID",
+    # Use parent PID as a more stable session identifier
+    str(os.getppid())))
+DEFAULT_MAX_LINES = 60
+DEFAULT_TIMEOUT = 600  # 10 minutes
+PORT_RANGE_START = 12000
+PORT_RANGE_END = 13000
+MCP_HELPERS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    "mcp", "mcp_helpers.ml"
+)
+
+# --- Registry (JSON file per server) ---
+
+def registry_dir():
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    return REGISTRY_DIR
+
+def server_file(name):
+    return registry_dir() / f"{name}.json"
+
+def load_server(name):
+    f = server_file(name)
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+def save_server(name, info):
+    server_file(name).write_text(json.dumps(info, indent=2) + "\n")
+
+def remove_server(name):
+    f = server_file(name)
+    if f.exists():
+        f.unlink()
+
+def list_servers():
+    d = registry_dir()
+    servers = {}
+    for f in sorted(d.glob("*.json")):
+        name = f.stem
+        info = load_server(name)
+        if info:
+            servers[name] = info
+    return servers
+
+def find_free_port():
+    """Find a free port in our range."""
+    used_ports = {info.get("port") for info in list_servers().values()}
+    for port in range(PORT_RANGE_START, PORT_RANGE_END):
+        if port in used_ports:
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(f"No free port in range {PORT_RANGE_START}-{PORT_RANGE_END}")
+
+def is_process_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+# --- TCP client for hol_server protocol ---
+
+class HolConnection:
+    """Client for monadius/hol_server server2.ml protocol."""
+
+    def __init__(self, host, port, timeout=DEFAULT_TIMEOUT):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.sock = None
+        self.buf = b""
+        self.server_pid = None
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((self.host, self.port))
+        # Read initial messages until ready
+        while True:
+            msg = self._read_line()
+            if msg.startswith("info:"):
+                # Parse PID from info:interrupt:true;pid:12345
+                m = re.search(r'pid:(\d+)', msg)
+                if m:
+                    self.server_pid = int(m.group(1))
+            elif msg.startswith("ready:"):
+                break
+
+    def send_command(self, cmd, timeout=None):
+        """Send a command and collect all output until ready:."""
+        if timeout:
+            self.sock.settimeout(timeout)
+        # Escape the command and send
+        escaped = cmd.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
+        self.sock.sendall((escaped + "\n").encode())
+        stdout_parts = []
+        stderr_parts = []
+        result = None
+        error = None
+        while True:
+            line = self._read_line()
+            if line.startswith("stdout:"):
+                stdout_parts.append(self._unescape(line[7:]))
+            elif line.startswith("stderr:"):
+                stderr_parts.append(self._unescape(line[7:]))
+            elif line.startswith("result:"):
+                result = self._unescape(line[7:])
+            elif line.startswith("rerror:"):
+                error = self._unescape(line[7:])
+            elif line.startswith("ready:"):
+                break
+        return {
+            "stdout": "".join(stdout_parts),
+            "stderr": "".join(stderr_parts),
+            "result": result,
+            "error": error,
+        }
+
+    def send_interrupt(self):
+        """Send $interrupt to cancel a running command."""
+        self.sock.sendall(b"$interrupt\n")
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.sendall(b"#quit\n")
+            except Exception:
+                pass
+            self.sock.close()
+            self.sock = None
+
+    def _read_line(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Server closed connection")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _unescape(s):
+        """Unescape server2.ml String.escaped output (OCaml conventions)."""
+        # OCaml's String.escaped uses \NNN (decimal), \\, \", \n, \t, \r
+        def repl(m):
+            c = m.group(0)
+            if c == "\\n": return "\n"
+            if c == "\\t": return "\t"
+            if c == "\\r": return "\r"
+            if c == "\\\\": return "\\"
+            if c == '\\"': return '"'
+            if c.startswith("\\") and len(c) == 4 and c[1:].isdigit():
+                return chr(int(c[1:]))
+            return c
+        return re.sub(r'\\[ntr\\"]|\\[0-9]{3}', repl, s)
+
+
+# --- Output formatting ---
+
+def truncate_output(text, max_lines, label="output"):
+    """Truncate output to max_lines, showing head and tail.
+    Full output is saved to a temp file when truncated."""
+    if not text:
+        return ""
+    # Strip ANSI escape codes
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text
+    head_n = max_lines * 2 // 3
+    tail_n = max_lines - head_n - 1
+    omitted = len(lines) - head_n - tail_n
+    # Save full output to temp file
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="holctl_")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    return "\n".join(
+        lines[:head_n]
+        + [f"\n... [{omitted} lines omitted, full output: {path}] ...\n"]
+        + lines[-tail_n:]
+    )
+
+def format_response(resp, max_lines):
+    """Format a hol_server response for the agent."""
+    parts = []
+    if resp.get("error"):
+        parts.append(f"ERROR: {resp['error']}")
+    if resp.get("result"):
+        parts.append(truncate_output(resp["result"], max_lines, "result"))
+    if resp.get("stdout"):
+        parts.append(truncate_output(resp["stdout"], max_lines, "stdout"))
+    if resp.get("stderr"):
+        stderr = resp["stderr"].strip()
+        if stderr:
+            parts.append(f"STDERR: {truncate_output(stderr, max_lines // 4, 'stderr')}")
+    return "\n".join(parts) if parts else "(no output)"
+
+
+# --- Server lifecycle ---
+
+def cmd_start(args):
+    name = args.name or f"hol-{int(time.time()) % 10000}"
+    existing = load_server(name)
+    if existing and is_process_alive(existing.get("pid", 0)):
+        print(f"Server '{name}' already running (pid={existing['pid']}, port={existing['port']})")
+        return
+
+    port = args.port or find_free_port()
+    checkpoint = args.checkpoint
+
+    # Find ocaml-hol binary (verifies HOL Light is built)
+    hol_sh = os.path.join(HOL_LIGHT_DIR, "hol.sh")
+    if not os.path.exists(hol_sh):
+        print(f"ERROR: {hol_sh} not found. Build HOL Light first:")
+        print(f"  cd {HOL_LIGHT_DIR} && make switch && eval $(opam env) && make")
+        sys.exit(1)
+
+    # Find hol_server source
+    hol_server_dir = os.environ.get("HOL_SERVER_DIR", "")
+    if not hol_server_dir:
+        for candidate in [
+            os.path.join(HOL_LIGHT_DIR, "hol_server"),
+            os.path.expanduser("~/workspace/hol_server"),
+            str(registry_dir() / "hol_server"),
+        ]:
+            if os.path.exists(os.path.join(candidate, "server2.ml")):
+                hol_server_dir = candidate
+                break
+
+    if not hol_server_dir:
+        hol_server_dir = str(registry_dir() / "hol_server")
+        if not os.path.exists(os.path.join(hol_server_dir, "server2.ml")):
+            print(f"Cloning monadius/hol_server to {hol_server_dir}...")
+            subprocess.run(
+                ["git", "clone", "-b", "vscode",
+                 "https://github.com/monadius/hol_server.git", hol_server_dir],
+                check=True
+            )
+
+    # Create patched server2.ml without lexer directives (we handle them in the pipe)
+    patched = os.path.join(hol_server_dir, "server2_nolexer.ml")
+    if not os.path.exists(patched):
+        with open(os.path.join(hol_server_dir, "server2.ml")) as f:
+            src = f.read()
+        src = src.replace("unset_jrh_lexer;;\n", "", 1)
+        src = src.replace("\nset_jrh_lexer;;\n", "\n", 1)
+        with open(patched, "w") as f:
+            f.write(src)
+
+    # Prepare launch
+    startup_dir = registry_dir() / "startup"
+    startup_dir.mkdir(exist_ok=True)
+    log_dir = registry_dir() / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"{name}.log"
+    pid_file = startup_dir / f"{name}.pid"
+
+    load_cmds = args.load or []
+
+    # Get opam env for the HOL Light switch
+    opam_env = {}
+    opam_switch = os.path.join(HOL_LIGHT_DIR, "_opam")
+    if os.path.isdir(opam_switch):
+        try:
+            result = subprocess.run(
+                ["opam", "env", "--switch", HOL_LIGHT_DIR, "--set-switch"],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.strip().split("\n"):
+                m = re.match(r"(\w+)='([^']*)'; export \w+;", line)
+                if m:
+                    opam_env[m.group(1)] = m.group(2)
+        except Exception:
+            pass
+
+    env = os.environ.copy()
+    env.update(opam_env)
+
+    # Choose launcher based on whether we're restoring from a checkpoint
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    if checkpoint:
+        ckpt_dir = os.path.join(HOL_LIGHT_DIR, f"hol-{checkpoint}.ckpt")
+        if not os.path.isdir(ckpt_dir):
+            print(f"ERROR: Checkpoint directory not found: {ckpt_dir}")
+            print(f"  Available checkpoints: holctl checkpoint-list")
+            sys.exit(1)
+        launcher = os.path.join(script_dir, "hol_launcher_ckpt.py")
+        cmd = [sys.executable, launcher, HOL_LIGHT_DIR, str(port), patched,
+               str(log_file), str(pid_file), ckpt_dir]
+    else:
+        launcher = os.path.join(script_dir, "hol_launcher.py")
+        cmd = [sys.executable, launcher, HOL_LIGHT_DIR, str(port), patched,
+               str(log_file), str(pid_file)] + load_cmds
+
+    subprocess.Popen(cmd, env=env, cwd=HOL_LIGHT_DIR,
+                     stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+    # The launcher daemonizes and writes the ocaml-hol PID to pid_file.
+    # Checkpoint restores take longer (need to find the restored PID).
+    wait_iters = 15 if checkpoint else 5
+    time.sleep(1)
+    pid = 0
+    for _ in range(wait_iters):
+        if pid_file.exists():
+            try:
+                new_pid = int(pid_file.read_text().strip())
+                if new_pid and is_process_alive(new_pid):
+                    pid = new_pid
+                    break
+            except (ValueError, OSError):
+                pass
+        time.sleep(1)
+
+    info = {
+        "name": name,
+        "port": port,
+        "pid": pid,
+        "session": SESSION_ID,
+        "checkpoint": checkpoint,
+        "started": time.time(),
+        "log": str(log_file),
+        "status": "starting",
+    }
+    save_server(name, info)
+
+    # Wait for server to become ready
+    print(f"Server '{name}' starting (pid={pid}, port={port})...")
+    ready = False
+    for i in range(300):  # Wait up to 5 minutes
+        time.sleep(1)
+        if not is_process_alive(pid):
+            print(f"ERROR: Server process died. Check log: {log_file}")
+            info["status"] = "dead"
+            save_server(name, info)
+            sys.exit(1)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(("127.0.0.1", port))
+            s.close()
+            ready = True
+            break
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            if i % 10 == 0 and i > 0:
+                print(f"  Still waiting... ({i}s)")
+            continue
+
+    if ready:
+        info["status"] = "ready"
+        save_server(name, info)
+        print(f"Server '{name}' ready on port {port}")
+    else:
+        print(f"WARNING: Server started but not yet accepting connections. Check log: {log_file}")
+        info["status"] = "starting"
+        save_server(name, info)
+
+
+def cmd_stop(args):
+    info = load_server(args.server)
+    if not info:
+        print(f"Server '{args.server}' not found")
+        return
+    pid = info.get("pid", 0)
+    if is_process_alive(pid):
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+        print(f"Server '{args.server}' stopped (pid={pid})")
+    else:
+        print(f"Server '{args.server}' was not running")
+    remove_server(args.server)
+
+
+def cmd_stop_all(args):
+    session_only = not args.all_sessions
+    for name, info in list_servers().items():
+        if session_only and info.get("session") != SESSION_ID:
+            continue
+        pid = info.get("pid", 0)
+        if is_process_alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+        remove_server(name)
+        print(f"Stopped '{name}'")
+
+
+def cmd_list(args):
+    servers = list_servers()
+    if not servers:
+        print("No servers registered")
+        return
+    for name, info in servers.items():
+        pid = info.get("pid", 0)
+        alive = is_process_alive(pid)
+        status = "ALIVE" if alive else "DEAD"
+        session = info.get("session", "?")
+        port = info.get("port", "?")
+        ckpt = info.get("checkpoint", "-")
+        mine = " (this session)" if session == SESSION_ID else ""
+        print(f"  {name:20s}  port={port}  pid={pid}  {status}  ckpt={ckpt}{mine}")
+        if not alive:
+            # Clean up dead entries
+            info["status"] = "dead"
+            save_server(name, info)
+
+
+def _connect(server_name, timeout=None):
+    info = load_server(server_name)
+    if not info:
+        print(f"Server '{server_name}' not found. Use 'holctl list' to see servers.")
+        sys.exit(1)
+    if not is_process_alive(info.get("pid", 0)):
+        print(f"Server '{server_name}' is dead (pid={info.get('pid')}). Restart it.")
+        sys.exit(1)
+    conn = HolConnection("127.0.0.1", info["port"], timeout=timeout or DEFAULT_TIMEOUT)
+    try:
+        conn.connect()
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        print(f"Cannot connect to '{server_name}' on port {info['port']}: {e}")
+        sys.exit(1)
+    return conn
+
+
+def _ensure_helpers(conn, server_name):
+    """Load mcp_helpers.ml into the server if not already loaded.
+    Verifies helpers are actually available even if the registry says so,
+    in case the OCaml process was restarted outside holctl."""
+    info = load_server(server_name)
+    if info and info.get("helpers_loaded"):
+        # Quick probe: check the function exists
+        resp = conn.send_command('mcp_json_goalstate;;')
+        output = (resp.get("result") or "") + resp.get("stdout", "")
+        if "mcp_json_goalstate" in output and "Unbound" not in output:
+            return True
+        # Stale flag — need to reload
+    if not os.path.isfile(MCP_HELPERS_PATH):
+        return False
+    resp = conn.send_command(f'#use "{MCP_HELPERS_PATH}";;')
+    output = (resp.get("stdout", "") + (resp.get("result") or "")).strip()
+    if "MCP helpers loaded" in output:
+        if info:
+            info["helpers_loaded"] = True
+            save_server(server_name, info)
+        return True
+    return False
+
+
+def _ocaml_escape(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _extract_json_from_resp(resp):
+    """Extract the JSON string printed via print_string from a hol_server response."""
+    return resp.get("stdout", "").strip()
+
+
+def cmd_eval(args):
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        resp = conn.send_command(args.code + ";;")
+        print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_goal(args):
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        if not args.raw and _ensure_helpers(conn, args.server):
+            resp = conn.send_command(
+                f'ignore(g `{args.term}`);; '
+                f'print_string (mcp_json_goalstate ());; print_newline ();;')
+            print(truncate_output(_extract_json_from_resp(resp), args.max_lines))
+        else:
+            resp = conn.send_command(f'g `{args.term}`;;')
+            print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_tactic(args):
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        if not args.raw and _ensure_helpers(conn, args.server):
+            resp = conn.send_command(
+                f'(try ignore(e({args.tactic})); '
+                f'print_string (mcp_json_after_tactic ()) '
+                f'with Failure s -> print_string (mcp_json_error s) '
+                f'| e -> print_string (mcp_json_error (Printexc.to_string e)));; '
+                f'print_newline ();;')
+            print(truncate_output(_extract_json_from_resp(resp), args.max_lines))
+        else:
+            resp = conn.send_command(f'e ({args.tactic});;')
+            print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_back(args):
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        n = args.n or 1
+        if not args.raw and _ensure_helpers(conn, args.server):
+            resp = conn.send_command(
+                f'print_string (mcp_json_backtrack {n});; print_newline ();;')
+            print(truncate_output(_extract_json_from_resp(resp), args.max_lines))
+        else:
+            for _ in range(n):
+                resp = conn.send_command("b();;")
+            print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_search(args):
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        # JSON mode only supports name-based search (name "PATTERN")
+        name_match = re.match(r'^name\s+"([^"]+)"$', args.pattern.strip())
+        if not args.raw and name_match and _ensure_helpers(conn, args.server):
+            limit = args.limit or 20
+            name = _ocaml_escape(name_match.group(1))
+            resp = conn.send_command(
+                f'print_string (mcp_json_search "{name}" {limit});; '
+                f'print_newline ();;')
+            print(truncate_output(_extract_json_from_resp(resp), args.max_lines))
+        else:
+            resp = conn.send_command(f'search [{args.pattern}];;')
+            print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_goal_state(args):
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        if not args.raw and _ensure_helpers(conn, args.server):
+            resp = conn.send_command(
+                'print_string (mcp_json_goalstate ());; print_newline ();;')
+            print(truncate_output(_extract_json_from_resp(resp), args.max_lines))
+        else:
+            resp = conn.send_command('try (p()) with _ -> print_string "No current goal";;')
+            print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_tactics(args):
+    """Apply multiple tactics in one round-trip."""
+    conn = _connect(args.server, timeout=args.timeout)
+    try:
+        if not args.raw and _ensure_helpers(conn, args.server):
+            tac_list = "[" + "; ".join(args.tactics) + "]"
+            resp = conn.send_command(
+                f'print_string (mcp_json_apply_tactics {tac_list});; '
+                f'print_newline ();;')
+            print(truncate_output(_extract_json_from_resp(resp), args.max_lines))
+        else:
+            # Fallback: apply one at a time
+            for tactic in args.tactics:
+                resp = conn.send_command(f'e ({tactic});;')
+            print(format_response(resp, args.max_lines))
+    finally:
+        conn.close()
+
+
+def cmd_interrupt(args):
+    info = load_server(args.server)
+    if not info:
+        print(f"Server '{args.server}' not found")
+        return
+    # Connect and send interrupt
+    try:
+        conn = HolConnection("127.0.0.1", info["port"], timeout=5)
+        conn.connect()
+        conn.send_interrupt()
+        conn.close()
+        print(f"Interrupt sent to '{args.server}'")
+    except Exception as e:
+        # Fallback: send SIGINT to the process
+        pid = info.get("pid", 0)
+        if is_process_alive(pid):
+            os.kill(pid, signal.SIGINT)
+            print(f"SIGINT sent to pid {pid}")
+        else:
+            print(f"Server '{args.server}' is not running")
+
+
+def cmd_status(args):
+    info = load_server(args.server)
+    if not info:
+        print(f"Server '{args.server}' not found")
+        return
+    pid = info.get("pid", 0)
+    alive = is_process_alive(pid)
+    print(f"Name:       {info.get('name')}")
+    print(f"Port:       {info.get('port')}")
+    print(f"PID:        {pid}")
+    print(f"Alive:      {alive}")
+    print(f"Session:    {info.get('session')}")
+    print(f"Checkpoint: {info.get('checkpoint', '-')}")
+    print(f"Log:        {info.get('log')}")
+    if alive:
+        # Try to connect and get goal state
+        try:
+            conn = HolConnection("127.0.0.1", info["port"], timeout=5)
+            conn.connect()
+            if _ensure_helpers(conn, args.server):
+                resp = conn.send_command(
+                    'print_string (mcp_json_goalstate ());; print_newline ();;')
+                goal_text = resp.get("stdout", "").strip()
+            else:
+                resp = conn.send_command('try (p()) with _ -> print_string "No current goal";;')
+                goal_text = (resp.get("stdout", "") + (resp.get("result") or "")).strip()
+            conn.close()
+            if goal_text:
+                print(f"Goal state: {truncate_output(goal_text, 20, 'goal')}")
+        except Exception:
+            print("Goal state: (could not query)")
+
+
+def cmd_checkpoint_create(args):
+    """Create a DMTCP checkpoint of HOL Light."""
+    ckpt_script = os.path.join(HOL_LIGHT_DIR, "make-checkpoint.sh")
+    if not os.path.exists(ckpt_script):
+        print(f"ERROR: {ckpt_script} not found")
+        sys.exit(1)
+
+    output_path = os.path.join(HOL_LIGHT_DIR, f"hol-{args.name}")
+    extra = ""
+    if args.extra_ml:
+        extra = " ".join(args.extra_ml)
+
+    cmd = [ckpt_script, output_path]
+    if extra:
+        cmd.append(extra)
+
+    print(f"Creating checkpoint '{args.name}'... (this may take a while)")
+    subprocess.run(cmd, cwd=HOL_LIGHT_DIR)
+
+
+def cmd_checkpoint_list(args):
+    """List available DMTCP checkpoints."""
+    ckpt_dirs = list(Path(HOL_LIGHT_DIR).glob("hol-*.ckpt"))
+    if not ckpt_dirs:
+        print("No checkpoints found")
+        return
+    for d in sorted(ckpt_dirs):
+        name = d.name.replace("hol-", "").replace(".ckpt", "")
+        script = d.parent / f"hol-{name}"
+        has_script = script.exists()
+        size_mb = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1024 / 1024
+        print(f"  {name:20s}  {size_mb:.0f}MB  script={'yes' if has_script else 'no'}")
+
+
+# --- Main ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="HOL Light server controller",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+        Examples:
+          holctl start --name arm1
+          holctl eval arm1 '1+1'
+          holctl goal arm1 '!n. n + 0 = n'
+          holctl tactic arm1 'INDUCT_TAC'
+          holctl back arm1
+          holctl search arm1 'name "ADD"'
+          holctl interrupt arm1
+          holctl stop arm1
+        """)
+    )
+    parser.add_argument("--max-lines", type=int, default=DEFAULT_MAX_LINES,
+                        help=f"Max output lines (default {DEFAULT_MAX_LINES})")
+    parser.add_argument("--full", action="store_true",
+                        help="Show full output (no truncation)")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                        help=f"Command timeout in seconds (default {DEFAULT_TIMEOUT})")
+    parser.add_argument("--raw", action="store_true",
+                        help="Output raw REPL text instead of structured JSON")
+
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("start", help="Start a new HOL Light server")
+    p.add_argument("--name", help="Server name (default: auto-generated)")
+    p.add_argument("--checkpoint", help="DMTCP checkpoint name to restore from")
+    p.add_argument("--port", type=int, help="Port (default: auto-assigned)")
+    p.add_argument("--load", nargs="*", help="ML files to load after HOL Light starts")
+
+    p = sub.add_parser("stop", help="Stop a server")
+    p.add_argument("server", help="Server name")
+
+    p = sub.add_parser("stop-all", help="Stop all servers")
+    p.add_argument("--all-sessions", action="store_true",
+                    help="Stop servers from all sessions (not just this one)")
+
+    sub.add_parser("list", help="List all servers")
+
+    p = sub.add_parser("eval", help="Evaluate OCaml/HOL Light code")
+    p.add_argument("server", help="Server name")
+    p.add_argument("code", help="Code to evaluate")
+
+    p = sub.add_parser("goal", help="Set a proof goal")
+    p.add_argument("server", help="Server name")
+    p.add_argument("term", help="Goal term (without backticks)")
+
+    p = sub.add_parser("tactic", help="Apply a tactic")
+    p.add_argument("server", help="Server name")
+    p.add_argument("tactic", help="Tactic expression")
+
+    p = sub.add_parser("back", help="Backtrack")
+    p.add_argument("server", help="Server name")
+    p.add_argument("n", nargs="?", type=int, help="Number of steps (default 1)")
+
+    p = sub.add_parser("search", help="Search theorems")
+    p.add_argument("server", help="Server name")
+    p.add_argument("pattern", help="Search pattern (e.g. 'name \"ADD\"')")
+    p.add_argument("--limit", type=int, default=20, help="Max results (default 20, JSON mode only)")
+
+    p = sub.add_parser("goal-state", help="Show current goal state")
+    p.add_argument("server", help="Server name")
+
+    p = sub.add_parser("tactics", help="Apply multiple tactics in one round-trip")
+    p.add_argument("server", help="Server name")
+    p.add_argument("tactics", nargs="+", help="Tactic expressions")
+
+    p = sub.add_parser("interrupt", help="Interrupt a running command")
+    p.add_argument("server", help="Server name")
+
+    p = sub.add_parser("status", help="Show server status and current goal")
+    p.add_argument("server", help="Server name")
+
+    p = sub.add_parser("checkpoint-create", help="Create a DMTCP checkpoint")
+    p.add_argument("name", help="Checkpoint name (e.g. 'base', 's2n-arm')")
+    p.add_argument("extra_ml", nargs="*", help="Extra ML to load before checkpointing")
+
+    sub.add_parser("checkpoint-list", help="List available checkpoints")
+
+    args = parser.parse_args()
+    if args.full:
+        args.max_lines = 999999
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    cmd_map = {
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "stop-all": cmd_stop_all,
+        "list": cmd_list,
+        "eval": cmd_eval,
+        "goal": cmd_goal,
+        "goal-state": cmd_goal_state,
+        "tactic": cmd_tactic,
+        "tactics": cmd_tactics,
+        "back": cmd_back,
+        "search": cmd_search,
+        "interrupt": cmd_interrupt,
+        "status": cmd_status,
+        "checkpoint-create": cmd_checkpoint_create,
+        "checkpoint-list": cmd_checkpoint_list,
+    }
+    cmd_map[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
